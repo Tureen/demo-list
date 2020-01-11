@@ -20,7 +20,7 @@ public class NioClient {
      * 3. 向服务器端发送数据
      */
     public void start() throws IOException {
-        SocketChannel socketChannel = SocketChannel.open(new InetSocketAddress("127.0.0.1", 8000));
+        SocketChannel socketChannel = SocketChannel.open(new InetSocketAddress("127.0.0.1", 8080));
 
         readMessageFromServer(socketChannel);
         sendMessageToServer(socketChannel);
