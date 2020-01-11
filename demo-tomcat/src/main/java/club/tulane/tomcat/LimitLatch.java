@@ -27,12 +27,12 @@ public class LimitLatch {
             count.decrementAndGet();
             return true;
         }
-    }
 
+    }
     private final Sync sync;
+
     private final AtomicLong count;
     private volatile long limit;
-
     public LimitLatch(long limit) {
         this.limit = limit;
         this.count = new AtomicLong(0);
@@ -41,5 +41,16 @@ public class LimitLatch {
 
     public void countUpOrAwait() throws InterruptedException {
         sync.acquireSharedInterruptibly(1);
+    }
+
+    public long countDown() {
+        sync.releaseShared(0);
+        long result = getCount();
+        System.out.println("Counting down["+Thread.currentThread().getName()+"] latch="+result);
+        return result;
+    }
+
+    private long getCount() {
+        return count.get();
     }
 }

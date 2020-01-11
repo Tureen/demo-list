@@ -1,5 +1,6 @@
 package club.tulane.tomcat;
 
+import java.io.EOFException;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
@@ -82,7 +83,7 @@ public class NioEndpoint {
 
     public void bind() throws IOException {
         serverSocket = ServerSocketChannel.open();
-        serverSocket.socket().bind(new InetSocketAddress(8000));
+        serverSocket.socket().bind(new InetSocketAddress(8080));
         serverSocket.configureBlocking(true);
     }
 
@@ -171,6 +172,18 @@ public class NioEndpoint {
         if(latch != null) latch.countUpOrAwait();
     }
 
+    private long countDownConnection() {
+        if(maxConnections == -1) return -1;
+        LimitLatch latch = connectionLimitLatch;
+        if(latch != null){
+            long result = latch.countDown();
+            if(result < 0){
+                System.out.println("endpoint.warn.incorrectConnectionCount");
+            }
+            return result;
+        }else return -1;
+    }
+
     public void setSocket(SocketChannel socketChannel) throws IOException {
         socketChannel.configureBlocking(false);
         NioChannel channel = new NioChannel(socketChannel);
@@ -181,9 +194,11 @@ public class NioEndpoint {
 
         private NioChannel socket;
         private int interestOps;
+        private NioSocketWrapper socketWrapper;
 
-        public PollerEvent(NioChannel socket, int interestOps) {
+        public PollerEvent(NioChannel socket, NioSocketWrapper w, int interestOps) {
             this.socket = socket;
+            socketWrapper = w;
             this.interestOps = interestOps;
         }
 
@@ -191,7 +206,7 @@ public class NioEndpoint {
         public void run() {
             if (interestOps == OP_REGISTER) {
                 try {
-                    socket.getIOChannel().register(socket.getPoller().getSelector(), SelectionKey.OP_READ);
+                    socket.getIOChannel().register(socket.getPoller().getSelector(), SelectionKey.OP_READ, socketWrapper);
                 } catch (ClosedChannelException e) {
                     e.printStackTrace();
                 }
@@ -219,8 +234,9 @@ public class NioEndpoint {
         }
 
         public void register(final NioChannel socket) {
+            NioSocketWrapper ka = new NioSocketWrapper(socket, NioEndpoint.this);
             socket.setPoller(this);
-            PollerEvent r = new PollerEvent(socket, OP_REGISTER);
+            PollerEvent r = new PollerEvent(socket, ka, OP_REGISTER);
             events.offer(r);
         }
 
@@ -230,17 +246,21 @@ public class NioEndpoint {
                 try {
                     events();
 
-                    int readyChannels = selector.select(selectorTimeout); // 获取可用channel数量(阻塞等待)
-                    if (readyChannels == 0) continue;
+                    int keyCount = selector.select(selectorTimeout); // 获取可用channel数量(阻塞等待)
+                    if (keyCount == 0) continue;
 
                     Set<SelectionKey> selectionKeySet = selector.selectedKeys(); // 获取可用channel集合
                     Iterator<SelectionKey> iterator = selectionKeySet.iterator();
                     while (iterator.hasNext()) {
-                        SelectionKey selectionKey = iterator.next();
+                        SelectionKey sk = iterator.next();
+                        NioSocketWrapper attachment = (NioSocketWrapper) sk.attachment();
+
                         iterator.remove(); // 移除Set中的当前selectionKey, 因为selectedKeys()每次返回原有集合
 
-                        new SocketProcessor(selector, selectionKey).run();
+                        processKey(sk, attachment);
                     }
+
+                    timeout();
                 } catch (IOException e) {
                     e.printStackTrace();
                 }
@@ -249,45 +269,122 @@ public class NioEndpoint {
 //            }
         }
 
+        private void timeout() {
+            for (SelectionKey key : selector.keys()) {
+                NioSocketWrapper ka = (NioSocketWrapper) key.attachment();
+                //we don't support any keys without attachments
+                if(ka == null){
+                    cancelledKey(key);
+                }
+            }
+        }
+
+        public void cancelledKey(SelectionKey key) {
+            NioSocketWrapper ka = null;
+            if(key == null) return;
+            ka = (NioSocketWrapper) key.attach(null);
+            if(ka != null){
+                try {
+                    ka.getSocket().close(true);
+                } catch (IOException e) {
+                    System.out.println("endpoint.debug.socketCloseFail");
+                }
+            }
+            if (ka != null) {
+                countDownConnection();
+            }
+        }
+
+        protected void processKey(SelectionKey sk, NioSocketWrapper attachment){
+            if(sk.isReadable()){
+                processSocket(attachment, SocketEvent.OPEN_READ);
+            }
+        }
+
+    }
+
+
+
+    private void processSocket(NioSocketWrapper socketWrapper, SocketEvent event) {
+        SocketProcessor sc = createSocketProcessor(socketWrapper, event);
+        sc.run();
+//        new Thread(sc).start();
+    }
+
+    private SocketProcessor createSocketProcessor(NioSocketWrapper socketWrapper, SocketEvent event) {
+        return new SocketProcessor(socketWrapper, event);
+    }
+
+    public static class NioSocketWrapper {
+        private NioChannel socket;
+        private NioEndpoint endpoint;
+
+        public NioSocketWrapper(NioChannel channel, NioEndpoint endpoint) {
+            this.socket = channel;
+            this.endpoint = endpoint;
+        }
+
+        public NioChannel getSocket() {
+            return socket;
+        }
     }
 
     protected class SocketProcessor implements Runnable {
 
-        private Selector selector;
-        private SelectionKey selectionKey;
 
-        public SocketProcessor(Selector selector, SelectionKey selectionKey) {
-            this.selector = selector;
-            this.selectionKey = selectionKey;
+        private NioSocketWrapper socketWrapper;
+        private SocketEvent event;
+
+        public SocketProcessor(NioSocketWrapper socketWrapper, SocketEvent event) {
+            this.socketWrapper = socketWrapper;
+            this.event = event;
         }
+
 
         @Override
         public void run() {
-            SocketChannel socketChannel = (SocketChannel) selectionKey.channel();
-            String request = readMessageFromChannel(socketChannel);
+            NioChannel socket = socketWrapper.getSocket();
+            SelectionKey key = socket.getIOChannel().keyFor(socket.getPoller().getSelector());
+
+            SocketChannel socketChannel = (SocketChannel) key.channel();
+            String request = readMessageFromChannel(socketChannel, key, socket.getPoller());
             System.out.println(request);
-            try {
-                socketChannel.register(selector, SelectionKey.OP_READ);
-            } catch (ClosedChannelException e) {
-                e.printStackTrace();
-            }
+
         }
 
-        public String readMessageFromChannel(SocketChannel socketChannel) {
+        public String readMessageFromChannel(SocketChannel socketChannel, SelectionKey key, Poller poller) {
             String request = null;
             try {
                 ByteBuffer byteBuffer = ByteBuffer.allocate(1024);
                 request = "";
-                while (socketChannel.read(byteBuffer) > 0) { // 将socketChannel的字节循环写入byteBuffer
+                while (readChannel(socketChannel, byteBuffer)) { // 将socketChannel的字节循环写入byteBuffer
                     byteBuffer.flip(); // 切换buffer为读模式
                     request += StandardCharsets.UTF_8.decode(byteBuffer);
                 }
+
+                try {
+                    socketChannel.register(poller.getSelector(), SelectionKey.OP_READ, socketWrapper);
+                } catch (ClosedChannelException e) {
+                    e.printStackTrace();
+                }
             } catch (IOException e) {
-                e.printStackTrace();
+                poller.cancelledKey(key);
             }
             return request;
         }
+
+        private boolean readChannel(SocketChannel socketChannel, ByteBuffer byteBuffer) throws IOException {
+            int nRead = socketChannel.read(byteBuffer);
+            if (nRead == -1) {
+                throw new EOFException();
+            }
+            return nRead > 0;
+        }
+
+
     }
+
+
 
     public static void main(String[] args) throws IOException {
         new NioEndpoint().start();
